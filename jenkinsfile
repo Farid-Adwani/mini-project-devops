@@ -1,0 +1,123 @@
+pipeline {
+    agent any
+    tools {
+        jdk 'jdk17'
+        nodejs 'NodeJS 16.2.0'
+    }
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        registry = 'faridadwanii/mp-devops' //To push an image to Docker Hub, you must first name your local image using your Docker Hub username and the repository name that you created through Docker Hub on the web.
+        registryCredential = 'docker-hub-login'
+        dockerImage = ''
+    }
+    stages {
+        stage('clean workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+        stage('Checkout from Git') {
+            steps {
+                git branch: 'main', url: 'https://github.com/Aj7Ay/Netflix-clone.git'
+            }
+        }
+        stage('Sonarqube Analysis ') {
+            steps {
+                withSonarQubeEnv('sonar-server') {
+                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=Netflix \
+                    -Dsonar.projectKey=Netflix '''
+                }
+            }
+        }
+        stage('quality gate') {
+            steps {
+                script {
+                waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token'
+                }
+            }
+        }
+        stage('Install Dependencies') {
+            steps {
+                sh 'npm install'
+            }
+        }
+        stage('OWASP FS SCAN') {
+            steps {
+                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
+                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+            }
+        }
+        stage('TRIVY FS SCAN') {
+            steps {
+                sh 'trivy fs . > trivyfs.txt'
+            }
+        }
+
+        stage('Build Image with Docker') {
+            steps {
+                script {
+                    img = registry + ":${env.BUILD_ID}"
+                    println("${img}")
+                    dockerImage = docker.build(img)
+
+                    // Tagging the image as 'latest'
+                    latestTag = registry + ':latest'
+                    sh "docker tag ${img} ${latestTag}"
+                }
+            }
+        }
+
+        stage('Push To DockerHub') {
+            steps {
+                script {
+                    docker.withRegistry('https://registry.hub.docker.com', registryCredential) {
+                        // Pushing the build ID tag
+                        dockerImage.push()
+
+                        // Pushing the 'latest' tag
+                        dockerImage.push('latest')
+                    }
+                }
+            }
+        }
+
+        stage('TRIVY') {
+            steps {
+                sh 'trivy image sevenajay/netflix:latest > trivyimage.txt'
+            }
+        }
+
+        stage('Deploy to container') {
+            steps {
+                sh "docker ps -q --filter 'name=netflix' | grep -q . && docker stop netflix || true"
+                sh "docker ps -aq --filter 'name=netflix' | grep -q . && docker rm netflix || true"
+                sh 'docker run -d --name netflix -p 8081:80 faridadwanii/mp-devops:latest'
+            }
+        }
+
+        stage('Deploy to kubernets') {
+            steps {
+                script {
+                    dir('Kubernetes') {
+                        withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'k8s', namespace: '', restrictKubeConfigAccess: false, serverUrl: '') {
+                                sh 'kubectl apply -f deployment.yml'
+                                sh 'kubectl apply -f service.yml'
+                        }
+                    }
+                }
+            }
+        }
+
+    }
+    post {
+        always {
+            emailext attachLog: true,
+            subject: "'${currentBuild.result}'",
+            body: "Project: ${env.JOB_NAME}<br/>" +
+                "Build Number: ${env.BUILD_NUMBER}<br/>" +
+                "URL: ${env.BUILD_URL}<br/>",
+            to: 'farid8569@gmail.com',
+            attachmentsPattern: 'trivyfs.txt,trivyimage.txt'
+        }
+    }
+}
